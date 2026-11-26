@@ -1,0 +1,13 @@
+{
+  "frontend": [
+    "checkout",
+    "catalog"
+  ],
+  "checkout": [
+    "payment",
+    "db"
+  ],
+  "payment": [],
+  "catalog": [],
+  "db": []
+}

@@ -6,41 +6,81 @@
 # Ground truth: for each case, what exactly do you store as the answer? It must use the same format as your output in question 3.
 # How many cases, and how do you make sure every component and every reason appears?
 
-import json, re
+import json
+import os
+import re
+import sys
+
+import pandas as pd
+import numpy as np
+
 from openai import OpenAI
 
 # 1. model (Ollama)
 client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")  
 MODEL = "qwen2.5:3b"
 
-# 2. Tools: plain Python functions (toy data; a real version reads the metric CSV)
+# 2. Tools: plain Python functions that read the data of the current case
+DATA_DIR = "data"
+DF = None  # metrics of the current case, set by load_case()
+
+# load the data of the current case into the global DF variable
+def load_case(case_id):
+    global DF
+    DF = pd.read_csv(os.path.join(DATA_DIR, f"{case_id}.csv"))
+
+# list all components and their callers in natural language 
 def list_components():
-    return ["docker_001", "docker_002", "db_003"]
+    with open(os.path.join(DATA_DIR, "system.json")) as f:
+        calls = json.load(f)
+    return "; ".join(f"{s} calls {', '.join(c) if c else 'nothing'}" for s, c in calls.items())
 
 def kpi_change(component, kpi):
-    data = {("docker_002", "cpu"): "normal 20%, peak 80% in the window, rising from 00:10"}
-    return data.get((component, kpi), "no change")
+    """Biggest jump of one KPI during the hour, and the average before and after it.
+    kpi is one of "cpu", "memory" or "latency"."""
+    if kpi not in ("cpu", "memory", "latency"):
+        return "kpi must be cpu, memory or latency"
+    s = DF[DF["service"] == component]
+    if s.empty:
+        names = ", ".join(sorted(DF["service"].unique()))
+        return f"'{component}' is not a component. Components are: {names}. KPIs are cpu, memory, latency."
+    v, times = s[kpi].to_numpy(), s["time"].to_numpy()
+    jumps = np.abs(np.diff(v))                 # change from one minute to the next
+    jumps[:4] = jumps[-4:] = 0                 # keep a few minutes on both sides to compare
+    k = int(np.argmax(jumps)) + 1              # minute with the biggest jump
+    change = (v[k:].mean() - v[:k].mean()) / v[:k].mean() * 100
+    return (f"{kpi}: biggest jump at {times[k]}, from {v[k-1]:.0f} to {v[k]:.0f}; "
+            f"average before {v[:k].mean():.0f}, average after {v[k:].mean():.0f} ({change:+.0f}%)")
 
 TOOLS = {"list_components": list_components, "kpi_change": kpi_change}
 
+
 # 3. Prompt
 SYSTEM = """You find the root cause of a failure.
+Possible reasons: CPU fault, memory fault, network delay.
 Tools:
-- list_components(): names of all components
-- kpi_change(component, kpi): how a KPI changed in the failure window; kpi is cpu, memory or network
+- list_components(): all services and which services each one calls
+- kpi_change(component, kpi): the biggest jump of one KPI during the hour, with the average before and after it; kpi is cpu, memory or latency
 Reply with ONE JSON object each turn:
 {"thought": "...", "action": "<tool name>", "args": {...}}
 When you know the answer:
-{"thought": "...", "action": "final_answer", "args": {"component": "...", "reason": "..."}}"""
+{"thought": "...", "action": "final_answer", "args": {"component": "...", "reason": "...", "time": "HH:MM"}}"""
 
-def run(question, max_steps=8):
+QUESTION = ("Between 00:00 and 01:00 one failure happened. "
+            "Find the root cause component, the reason and the time it started.")
+
+def run(question, max_steps=15):
     # 4. memory = the message list
     messages = [{"role": "system", "content": SYSTEM},  
                 {"role": "user", "content": question}]
     
     # 5. loop with a step limit
     for step in range(max_steps):  
-        # call the model, get the reply, temperature=0 for highest probaiility output                   
+        # if last step, tell the model to reply with final_answer
+        if step == max_steps - 1:
+            messages.append({"role": "user", "content": "Last step: reply with final_answer now."})
+        
+        # call the model, get the reply, temperature=0 for highest probability output 
         reply = client.chat.completions.create(
             model=MODEL, messages=messages, temperature=0).choices[0].message.content
         # append the reply to the memory
@@ -68,9 +108,11 @@ def run(question, max_steps=8):
             except Exception as e:                        # bad arguments -> tell the model
                 obs = f"Tool error: {e}"
         
+        print(f"Observation: {obs}")
         # 9. append the observation to the memory
         messages.append({"role": "user", "content": f"Observation: {obs}"})
     return {"error": "no answer within the step limit"}
 
 if __name__ == "__main__":
-    print(run("Between 00:00 and 00:30 one failure happened. Which component, and why?"))
+    load_case("case_01")             
+    print(run(QUESTION))
