@@ -19,6 +19,7 @@ from openai import OpenAI
 # 1. model (Ollama)
 client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")  
 MODEL = "qwen2.5:7b"
+CODER_MODEL = "qwen2.5-coder:7b"  # LLM 2: writes pandas code for query_data
 
 # 2. Tools: plain Python functions that read the data of the current case
 DATA_DIR = "data"
@@ -35,24 +36,57 @@ def list_components():
         calls = json.load(f)
     return "; ".join(f"{s} calls {', '.join(c) if c else 'nothing'}" for s, c in calls.items())
 
-def kpi_change(component, kpi):
-    """Biggest jump of one KPI during the hour, and the average before and after it.
-    kpi is one of "cpu", "memory" or "latency"."""
-    if kpi not in ("cpu", "memory", "latency"):
-        return "kpi must be cpu, memory or latency"
-    s = DF[DF["service"] == component]
-    if s.empty:
-        names = ", ".join(sorted(DF["service"].unique()))
-        return f"'{component}' is not a component. Components are: {names}. KPIs are cpu, memory, latency."
-    v, times = s[kpi].to_numpy(), s["time"].to_numpy()
-    jumps = np.abs(np.diff(v))                 # change from one minute to the next
-    jumps[:4] = jumps[-4:] = 0                 # keep a few minutes on both sides to compare
-    k = int(np.argmax(jumps)) + 1              # minute with the biggest jump
-    change = (v[k:].mean() - v[:k].mean()) / v[:k].mean() * 100
-    return (f"{kpi}: biggest jump at {times[k]}, from {v[k-1]:.0f} to {v[k]:.0f}; "
-            f"average before {v[:k].mean():.0f}, average after {v[k:].mean():.0f} ({change:+.0f}%)")
 
-TOOLS = {"list_components": list_components, "kpi_change": kpi_change}
+CODER_SYSTEM = """You write Python (pandas) code to answer a question about monitoring data.
+A DataFrame named DF is already loaded. Its columns are exactly: "time", "service", "cpu", "memory", "latency".
+- time: "HH:MM" string, one row per service per minute from 00:00 to 00:59 (sorted by time)
+- service: frontend, checkout, payment, catalog, db
+- cpu and memory are percentages, latency is in milliseconds; all have some random noise
+First rows of DF:
+{head}
+pandas is imported as pd and numpy as np.
+Rules:
+- Put the answer in a variable named result (a number, string, Series or small DataFrame of at most 20 rows).
+- For times, use the values of the "time" column, never the row index.
+- Find when a change starts from the data, separately for each service; never split the hour at a fixed minute.
+- Do not print, plot, read or write files.
+- Rows of different services are mixed. Always group by service first (DF.groupby("service")) before diff, shift or mean.
+- Never return the raw rows. Return a summary: at most one row per service and KPI.
+- When asked whether or when a KPI changes, compute for each service and KPI:
+  the minute with the biggest jump (diff within the service), the average before and after that minute,
+  and the change in percent. Report service, kpi, start_time, average_before, average_after, change_percent.
+  A short spike shows a big jump but almost no change in the averages.
+Reply with only one Python code block."""
+
+
+def query_data(question):
+    """LLM 2 writes pandas code for the question; the code runs on DF; the agent gets the result table."""
+    system = CODER_SYSTEM.replace("{head}", DF.head(5).to_string(index=False))
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": question}]
+    error = ""
+    for attempt in range(2):                              # one retry if the code fails
+        reply = client.chat.completions.create(
+            model=CODER_MODEL, messages=messages, temperature=0).choices[0].message.content
+        m = re.search(r"```(?:python)?\n(.*?)```", reply, re.S)
+        code = m.group(1) if m else reply
+        print(f"    [coder] code:\n{code.strip()}")
+        try:
+            env = {"DF": DF.copy(), "pd": pd, "np": np}
+            exec(code, env)                               # run the code
+            result = env["result"]
+            if hasattr(result, "__len__") and not isinstance(result, str) and len(result) > 20:
+                raise ValueError(f"result has {len(result)} rows; return a summary with at most 20 rows")    
+            text = result.to_string() if hasattr(result, "to_string") else str(result)
+            return f"Result of the code for '{question}':\n{text[:2000]}"
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+            print(f"    [coder] error: {error}")
+            messages += [{"role": "assistant", "content": reply},
+                         {"role": "user", "content": f"The code failed with: {error}\n"
+                          f"The columns of DF are exactly {list(DF.columns)}. Fix the code and reply with the code only."}]
+    return f"The helper could not answer (code error: {error}). Ask in a simpler way."
+
+TOOLS = {"list_components": list_components, "query_data": query_data}
 
 
 # 3. Prompt
@@ -61,11 +95,12 @@ Possible reasons: CPU fault, memory fault, network delay.
 
 Tools:
 - list_components(): all services and which services each one calls
-- kpi_change(component, kpi): the biggest jump of one KPI during the hour, with the average before and after it; kpi is cpu, memory or latency
+- query_data(question): ask any question about the cpu, memory and latency data, in plain English.
+  A helper writes and runs pandas code and returns the result table. Ask one clear question at a time.
 
 How to diagnose (in this order):
 1. Look at the system: call list_components to see which service calls which.
-2. Find changes: check cpu, memory and latency of EVERY service.
+2. Find changes: use query_data to check cpu, memory and latency of EVERY service (when each one changes, and its average before and after the change).
 3. Keep only real faults: a real fault changes the average a lot (more than 50%) and stays.
    A change of a few percent, or a short spike that goes back to normal, is noise. Ignore it.
 4. Find the root cause among the real faults:
@@ -102,12 +137,15 @@ def run(question, max_steps=20):
         # 6. log every step
         print(f"--- step {step}\n{reply}")                
         # 7. parse and check the reply: must be a JSON object with "action" and optional "args"
-        try:                                              
-            act = json.loads(re.search(r"\{.*\}", reply, re.S).group(0))
+        try:
+            start = reply.index("{")                                  # where the JSON begins
+            act, _ = json.JSONDecoder().raw_decode(reply[start:])     # stops at the end of the first object
             # name is the tool name or "final_answer", args is a dict with the arguments for the tool
             name, args = act["action"], act.get("args", {})
-        except Exception:
-            messages.append({"role": "user", "content": "Invalid format. Reply with ONE JSON object."})
+        except Exception as e:
+            note = f"Invalid format ({e}). Reply with ONE JSON object only."
+            print(f"Note: {note}")                                    # show it in the log
+            messages.append({"role": "user", "content": note})
             continue
         
         # 8. execute the action, name is either a tool or "final_answer"
